@@ -1,0 +1,16 @@
+cff-version: 1.2.0
+message: "If you use silent-failures in your work, please cite it as below."
+title: "silent-failures: small checks for the failures that stay silent"
+type: software
+authors:
+  - family-names: Bichel
+    given-names: Yauhen
+license: Apache-2.0
+repository-code: "https://github.com/YauhenBichel/silent-failures"
+version: 0.1.0
+keywords:
+  - linux
+  - watchdog
+  - systemd
+  - linux-firmware
+  - incident-response

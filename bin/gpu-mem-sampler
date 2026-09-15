@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Yauhen Bichel
+#
+# gpu-mem-sampler: a line every few seconds with GPU and system memory, so the next memory storm or
+# freeze can be traced to the minute.
+#
+#   gpu-mem-sampler                           a line every 10 s, appended to the log
+#   gpu-mem-sampler --once                    print one line and exit
+#   gpu-mem-sampler --interval 5 --log FILE   also --max-bytes N: rotate there, one old file kept (20 MB)
+#
+#   2026-09-14T22:53:42Z gtt=0.0 vram=20.7 avail=46.1 swap=4.0 top=python:9.6
+#
+# vram and gtt: GiB in use on the first GPU whose driver reports them in sysfs (amdgpu does); without
+# one, vram comes from nvidia-smi when it is there, and gtt is "-". avail: MemAvailable. swap: swap in
+# use. top: the process with the most resident memory, in GiB. No root needed.
+# Default log: ${XDG_STATE_HOME:-~/.local/state}/gpu-mem-sampler/gpu-memory.log
+#
+# Why: after a server froze, the last line this wrote, 13 seconds after the journal's last line, showed
+# what the GPU was doing at that moment. Nothing else on the box had it.
+set -uo pipefail
+export LC_ALL=C
+
+usage() { echo "usage: gpu-mem-sampler [--once] [--interval S] [--log FILE] [--max-bytes N]" >&2; exit 2; }
+ROOT=${SF_ROOT:-}
+interval=10 once=0 max_bytes=20000000
+log=${XDG_STATE_HOME:-$HOME/.local/state}/gpu-mem-sampler/gpu-memory.log
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --once)      once=1; shift ;;
+    --interval)  [ $# -ge 2 ] || usage; interval=$2; shift 2 ;;
+    --log)       [ $# -ge 2 ] || usage; log=$2; shift 2 ;;
+    --max-bytes) [ $# -ge 2 ] || usage; max_bytes=$2; shift 2 ;;
+    -h|--help)   sed -n '5,20p' "$0" | sed -E 's/^# ?//'; exit 0 ;;
+    *) usage ;;
+  esac
+done
+[[ "$interval" =~ ^[1-9][0-9]*$ && "$max_bytes" =~ ^[0-9]+$ ]] || { echo "gpu-mem-sampler: --interval and --max-bytes take whole numbers" >&2; exit 2; }
+
+card=""
+for d in "$ROOT"/sys/class/drm/card*/device; do
+  if [ -r "$d/mem_info_vram_used" ]; then card=$d; break; fi
+done
+
+gib() { awk -v v="$1" 'BEGIN { printf "%.1f", v / 1073741824 }'; }
+
+sample() {
+  local gtt vram avail swap top mib
+  if [ -n "$card" ]; then
+    gtt=$(gib "$(cat "$card/mem_info_gtt_used" 2>/dev/null || echo 0)")
+    vram=$(gib "$(cat "$card/mem_info_vram_used" 2>/dev/null || echo 0)")
+  elif command -v nvidia-smi >/dev/null 2>&1; then
+    mib=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | head -n1 | tr -dc '0-9')
+    gtt=-
+    vram=$(gib "$(( ${mib:-0} * 1048576 ))")
+  else
+    gtt=- vram=-
+  fi
+  avail=$(awk '/^MemAvailable:/ { printf "%.1f", $2 / 1048576 }' "$ROOT/proc/meminfo")
+  swap=$(awk '/^SwapTotal:/ { t = $2 } /^SwapFree:/ { f = $2 } END { printf "%.1f", (t - f) / 1048576 }' "$ROOT/proc/meminfo")
+  top=$(ps -eo rss=,comm= --sort=-rss 2>/dev/null | head -n1 | awk '{ printf "%s:%.1f", $2, $1 / 1048576 }')
+  echo "$(date -u +%FT%TZ) gtt=$gtt vram=$vram avail=$avail swap=$swap top=${top:-?}"
+}
+
+if [ "$once" = 1 ]; then
+  sample
+  exit 0
+fi
+mkdir -p "$(dirname "$log")"
+while true; do
+  sample >> "$log"
+  if [ "$(stat -c %s "$log" 2>/dev/null || echo 0)" -gt "$max_bytes" ]; then mv -f "$log" "$log.1"; fi
+  sleep "$interval"
+done

@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: shellcheck and tests (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: shellcheck
+        run: shellcheck -x bin/watchdog-doctor bin/last-boot bin/timer-failures bin/gpu-mem-sampler mac/reachability-watch.sh tests/*.sh
+      - name: Tests (no root, no network)
+        run: bash tests/run.sh
+
+  macos:
+    name: mac watcher and firmware-drift (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Syntax and plist
+        run: bash -n mac/reachability-watch.sh && plutil -lint mac/reachability-watch.plist
+      - name: firmware-drift tests
+        run: python3 -m unittest discover -s tests -p 'test_*.py'

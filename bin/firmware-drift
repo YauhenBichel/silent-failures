@@ -1,0 +1,225 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Yauhen Bichel
+"""firmware-drift: which upstream linux-firmware version are my firmware files, and how far behind?
+
+  firmware-drift --module amdgpu --match gc_11_5_1   the files amdgpu can load, filtered by name
+  firmware-drift amdgpu/gc_11_5_1_mes_2.bin          one file, found where the kernel looks for it
+  firmware-drift /lib/firmware/amdgpu/vpe_6_1_0.bin.zst --json
+
+Each installed file is hashed (after decompressing .zst or .xz) and compared with the same file's
+versions in upstream linux-firmware, newest first, until one has the same SHA-256. A distribution's
+package version says little: one read 20240318 while the files inside had been refreshed in 2026, and
+were still three updates behind upstream.
+
+Exit 0: every file is upstream's newest version. 1: at least one is behind. 2: none is behind, but at
+least one could not be matched (older than --depth versions, changed locally, or not in upstream).
+Needs network access to gitlab.com, and the zstd tool for .zst files.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import lzma
+import os
+import platform
+import shutil
+import subprocess
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Callable
+
+API = "https://gitlab.com/api/v4/projects/kernel-firmware%2Flinux-firmware"
+USER_AGENT = "firmware-drift (+https://github.com/YauhenBichel/silent-failures)"
+
+
+def search_dirs(root: str = "/", release: str | None = None) -> list[Path]:
+    """The kernel's own search order for firmware (drivers/base/firmware_loader/main.c)."""
+    release = release or platform.release()
+    base = Path(root) / "lib" / "firmware"
+    return [base / "updates" / release, base / "updates", base / release, base]
+
+
+def find_installed(name: str, dirs: list[Path]) -> Path | None:
+    """The file the kernel would load: an uncompressed one in any directory first, then .zst, then .xz."""
+    for suffix in ("", ".zst", ".xz"):
+        for d in dirs:
+            path = d / (name + suffix)
+            if path.is_file():
+                return path
+    return None
+
+
+def name_for(path: Path, dirs: list[Path]) -> str:
+    """The firmware name of an installed path: relative to its firmware directory, compression removed."""
+    real = path.resolve()
+    for d in dirs:
+        try:
+            name = str(real.relative_to(d.resolve()))
+        except ValueError:
+            continue
+        for suffix in (".zst", ".xz"):
+            if name.endswith(suffix):
+                name = name[: -len(suffix)]
+        return name
+    raise ValueError(f"{path} is not under a firmware directory ({', '.join(map(str, dirs))})")
+
+
+def content(path: Path) -> bytes:
+    if path.suffix == ".xz":
+        return lzma.decompress(path.read_bytes())
+    if path.suffix == ".zst":
+        if not shutil.which("zstd"):
+            raise RuntimeError("the zstd tool is needed to read .zst files")
+        return subprocess.run(["zstd", "-dcq", str(path)], check=True, capture_output=True).stdout
+    return path.read_bytes()
+
+
+def sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def module_firmware(module: str) -> list[str]:
+    out = subprocess.run(["modinfo", "-F", "firmware", module], capture_output=True, text=True, check=False)
+    return [line.strip() for line in out.stdout.splitlines() if line.strip()]
+
+
+def http_get(url: str) -> bytes:
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(request, timeout=60) as response:
+        return response.read()
+
+
+@dataclass
+class Version:
+    commit: str
+    date: str
+    title: str
+
+
+class Upstream:
+    """One file's history in linux-firmware, and the file's hash at a commit (kept on disk once known)."""
+
+    def __init__(self, get: Callable[[str], bytes] = http_get, cache: Path | None = None) -> None:
+        self.get = get
+        self.cache = cache
+
+    def history(self, name: str, depth: int) -> list[Version]:
+        query = urllib.parse.urlencode({"path": name, "per_page": depth})
+        commits = json.loads(self.get(f"{API}/repository/commits?{query}"))
+        return [Version(c["id"], c["committed_date"][:10], c["title"]) for c in commits]
+
+    def hash_at(self, name: str, commit: str) -> str | None:
+        cached = self.cache / commit / (name.replace("/", "__") + ".sha256") if self.cache else None
+        if cached is not None and cached.is_file():
+            return cached.read_text().strip() or None
+        try:
+            digest = sha256(self.get(f"{API}/repository/files/{urllib.parse.quote(name, safe='')}/raw?ref={commit}"))
+        except urllib.error.HTTPError as error:
+            if error.code != 404:
+                raise
+            digest = ""  # the file did not exist under this name at that commit
+        if cached is not None:
+            cached.parent.mkdir(parents=True, exist_ok=True)
+            cached.write_text(digest)
+        return digest or None
+
+
+@dataclass
+class Drift:
+    name: str
+    path: str
+    sha256: str
+    match: Version | None = None
+    newer: list[Version] = field(default_factory=list)
+    compared: int = 0
+
+    @property
+    def state(self) -> str:
+        if self.match is None:
+            return "unknown"
+        return "behind" if self.newer else "current"
+
+
+def drift(name: str, path: Path, upstream: Upstream, depth: int) -> Drift:
+    result = Drift(name, str(path), sha256(content(path)))
+    versions = upstream.history(name, depth)
+    for i, version in enumerate(versions):
+        result.compared = i + 1
+        if upstream.hash_at(name, version.commit) == result.sha256:
+            result.match, result.newer = version, versions[:i]
+            break
+    return result
+
+
+def main(argv: list[str] | None = None, upstream: Upstream | None = None, dirs: list[Path] | None = None) -> int:
+    doc = (__doc__ or "").strip().splitlines()
+    parser = argparse.ArgumentParser(prog="firmware-drift", description=doc[0],
+                                     epilog="\n".join(doc[1:]), formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("files", nargs="*", help="firmware names (amdgpu/x.bin) or installed paths")
+    parser.add_argument("--module", help="the firmware files this kernel module can load (modinfo -F firmware)")
+    parser.add_argument("--match", default="", help="only names that contain this text")
+    parser.add_argument("--depth", type=int, default=30, help="upstream versions to compare per file (default 30)")
+    parser.add_argument("--json", action="store_true", help="print JSON instead of a table")
+    parser.add_argument("--cache", default=os.path.join(os.path.expanduser("~"), ".cache", "firmware-drift"),
+                        help="where upstream hashes are kept (default ~/.cache/firmware-drift)")
+    args = parser.parse_args(argv)
+    dirs = dirs or search_dirs()
+    upstream = upstream or Upstream(cache=Path(args.cache))
+
+    names = list(args.files) + (module_firmware(args.module) if args.module else [])
+    if not names:
+        parser.error("give firmware files, or --module")
+    targets: dict[str, Path] = {}
+    missing: list[str] = []
+    for item in names:
+        if args.match and args.match not in item:
+            continue
+        given = Path(item)
+        if given.is_file():
+            targets.setdefault(name_for(given, dirs), given)
+        elif (found := find_installed(item, dirs)) is not None:
+            targets.setdefault(item, found)
+        elif item in args.files:
+            missing.append(item)  # a module lists firmware for chips you do not have: those are skipped quietly
+
+    results = [drift(name, path, upstream, args.depth) for name, path in targets.items()]
+    if args.json:
+        print(json.dumps([{"name": r.name, "path": r.path, "sha256": r.sha256, "state": r.state,
+                           "installed": asdict(r.match) if r.match else None,
+                           "newer": [asdict(v) for v in r.newer]} for r in results], indent=1))
+    elif results:
+        width = max(len(r.name) for r in results)
+        print(f"{'file':<{width}}  {'installed = upstream':<24}  newer upstream versions")
+        for r in results:
+            installed = f"{r.match.commit[:12]} {r.match.date}" if r.match else f"no match in {r.compared}"
+            if r.match is None:
+                newer = "-"
+            elif r.newer:
+                newer = f"{len(r.newer)}, the newest {r.newer[0].commit[:12]} {r.newer[0].date}"
+            else:
+                newer = "none: current"
+            print(f"{r.name:<{width}}  {installed:<24}  {newer}")
+    for item in missing:
+        print(f"firmware-drift: {item} is not installed", file=sys.stderr)
+
+    states = {r.state for r in results}
+    if "behind" in states:
+        return 1
+    if "unknown" in states or missing or not results:
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (RuntimeError, ValueError, OSError, urllib.error.URLError, subprocess.CalledProcessError) as error:
+        print(f"firmware-drift: {error}", file=sys.stderr)
+        sys.exit(2)
