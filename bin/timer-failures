@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Yauhen Bichel
+#
+# timer-failures: which scheduled jobs keep failing where nobody looks?
+#
+#   timer-failures              system timers, and your user timers
+#   timer-failures --system     system timers only
+#   timer-failures --user       your user timers only
+#   timer-failures --days N     count failed runs over the last N days (default 7)
+#   timer-failures --all        also list the jobs whose last run succeeded
+#
+# For every systemd timer it reads the service the timer starts: the result and exit status of its
+# last run, when that was, and how many runs failed in the last N days. A timer that fires on time
+# looks healthy even when its job fails every night. Exit 0: no job's last run failed. Exit 1: at
+# least one did. Exit 2: bad usage.
+#
+# Why: a nightly backup failed every night for days. Its timer kept firing, and the only alert watched
+# another job's success stamp.
+#
+# Tests take systemctl and journalctl from PATH.
+set -uo pipefail
+export LC_ALL=C
+
+usage() { echo "usage: timer-failures [--system|--user] [--days N] [--all]" >&2; exit 2; }
+scopes=(system user) days=7 all=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --system) scopes=(system); shift ;;
+    --user)   scopes=(user); shift ;;
+    --days)   [ $# -ge 2 ] || usage; days=$2; shift 2 ;;
+    --all)    all=1; shift ;;
+    -h|--help) sed -n '5,20p' "$0" | sed -E 's/^# ?//'; exit 0 ;;
+    *) usage ;;
+  esac
+done
+[[ "$days" =~ ^[1-9][0-9]*$ ]] || { echo "timer-failures: --days takes a whole number of days" >&2; exit 2; }
+
+failing=0 checked=0
+prop() { sed -n "s/^$1=//p" <<< "$2"; }
+
+# shellcheck disable=SC2086  # $flag is empty or --user, and must vanish when empty
+check_scope() {
+  local scope=$1 flag="" timer svc props result status when events nfail last
+  [ "$scope" = user ] && flag=--user
+  while read -r timer _; do
+    [ -n "$timer" ] || continue
+    svc=$(systemctl $flag show -p Unit --value "$timer" 2>/dev/null)
+    [ -n "$svc" ] || continue
+    checked=$((checked + 1))
+    props=$(systemctl $flag show "$svc" -p Result -p ExecMainStatus -p ExecMainExitTimestamp 2>/dev/null)
+    result=$(prop Result "$props"); status=$(prop ExecMainStatus "$props"); when=$(prop ExecMainExitTimestamp "$props")
+    events=$(journalctl $flag -u "$svc" --since "-${days}d" --no-pager -o short-iso 2>/dev/null \
+               | grep -E "Failed with result|Deactivated successfully|Succeeded\.|Finished ")
+    nfail=$(grep -c "Failed with result" <<< "$events")
+    last=$(tail -n1 <<< "$events")
+    # Result, not the exit status: a unit may count a non-zero status as success (SuccessExitStatus=)
+    if [ -n "$when" ] && [ "$result" != success ]; then
+      printf '  FAIL  %-6s %-36s %s, exit %s, at %s; %s failed run(s) in %s days\n' \
+        "$scope" "$svc" "$result" "$status" "$when" "$nfail" "$days"
+      failing=$((failing + 1))
+    elif [ -z "$when" ] && grep -q "Failed with result" <<< "$last"; then
+      printf '  FAIL  %-6s %-36s its last run failed before this boot, at %s; %s failed run(s) in %s days\n' \
+        "$scope" "$svc" "${last%% *}" "$nfail" "$days"
+      failing=$((failing + 1))
+    elif [ "$all" = 1 ]; then
+      printf '  ok    %-6s %-36s %s\n' "$scope" "$svc" "${when:-not run since this boot}"
+    fi
+  done < <(systemctl $flag list-units --type=timer --all --plain --no-legend --no-pager 2>/dev/null)
+}
+
+echo "timer-failures: scheduled jobs whose last run failed (failures counted over $days days)"
+echo
+for s in "${scopes[@]}"; do check_scope "$s"; done
+echo
+echo "$checked timer(s) checked, $failing failing."
+[ "$failing" = 0 ]

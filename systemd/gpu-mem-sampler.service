@@ -1,0 +1,21 @@
+# A user service: GPU and system memory every 10 s, so the next memory storm or freeze can be traced.
+#   install -D -m 755 bin/gpu-mem-sampler ~/.local/bin/gpu-mem-sampler
+#   install -D -m 644 systemd/gpu-mem-sampler.service ~/.config/systemd/user/gpu-mem-sampler.service
+#   systemctl --user daemon-reload && systemctl --user enable --now gpu-mem-sampler
+#   loginctl enable-linger "$USER"     # keep it running while you are logged out
+[Unit]
+Description=GPU and system memory every 10 s (silent-failures)
+Documentation=https://github.com/YauhenBichel/silent-failures
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/gpu-mem-sampler
+Restart=always
+RestartSec=10
+# It records trouble; it must never cause any.
+Nice=19
+IOSchedulingClass=idle
+MemoryMax=64M
+
+[Install]
+WantedBy=default.target

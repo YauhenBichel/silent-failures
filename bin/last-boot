@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Yauhen Bichel
+#
+# last-boot: did the previous boot end cleanly, and what was happening just before it ended?
+#
+#   last-boot                  the boot before this one
+#   last-boot --boot -2        an older boot
+#   last-boot --notify CMD     when it ended uncleanly, also run: CMD "<title>" "<summary>"
+#
+# Exit 0: it ended with a shutdown or a reboot. Exit 1: it just stopped: a freeze, a crash or lost
+# power. Exit 2: unknown or bad usage (no such boot, or a journal you cannot read: use a member of the
+# systemd-journal or adm group, or sudo).
+#
+# How it tells: a clean end writes "systemd-shutdown" and "Journal stopped" into the journal; a freeze
+# leaves neither, and the log simply ends. journald's "uncleanly shut down" warning at the next boot is
+# not used: it also appears after clean reboots.
+#
+# Tests take journalctl and hostname from PATH, and move /var/lib/systemd/pstore under SF_ROOT.
+set -uo pipefail
+export LC_ALL=C
+
+usage() { echo "usage: last-boot [--boot -N] [--notify CMD]" >&2; exit 2; }
+boot=-1 notify=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --boot)   [ $# -ge 2 ] || usage; boot=$2; shift 2 ;;
+    --notify) [ $# -ge 2 ] || usage; notify=$2; shift 2 ;;
+    -h|--help) sed -n '5,17p' "$0" | sed -E 's/^# ?//'; exit 0 ;;
+    *) usage ;;
+  esac
+done
+[[ "$boot" =~ ^-[1-9][0-9]*$ ]] || { echo "last-boot: --boot takes an offset such as -1 or -2" >&2; exit 2; }
+
+# IDX BOOT ID                          FIRST ENTRY                 LAST ENTRY
+#  -1 c652dc6ee22a449db5a7f72b9befa34c Sun 2026-09-13 22:40:14 UTC Mon 2026-09-14 22:53:29 UTC
+boots=$(journalctl --list-boots --no-pager 2>/dev/null)
+row=$(awk -v i="$boot" '$1 == i' <<< "$boots")
+[ -n "$row" ] || { echo "last-boot: boot $boot is not in the journal (or the journal is not readable)"; exit 2; }
+read -r _ id _ first_d first_t first_z _ last_d last_t last_z <<< "$row"
+next_row=$(awk -v i="$((boot + 1))" '$1 == i' <<< "$boots")
+
+tail_lines=$(journalctl -b "$boot" -n 80 --no-pager -o short-iso 2>/dev/null)
+[ -n "$tail_lines" ] || { echo "last-boot: boot $boot has no readable log lines"; exit 2; }
+if grep -qE 'systemd-shutdown\[|Journal stopped' <<< "$tail_lines"; then clean=1; else clean=0; fi
+
+gap=""
+if [ -n "$next_row" ]; then
+  read -r _ _ _ next_d next_t next_z _ <<< "$next_row"
+  s=$(( $(date -d "$next_d $next_t $next_z" +%s) - $(date -d "$last_d $last_t $last_z" +%s) ))
+  gap=$(printf '%dh %02dm %02ds' $((s / 3600)) $((s % 3600 / 60)) $((s % 60)))
+fi
+
+echo "last-boot: boot $boot (${id:0:12}), $first_d $first_t $first_z to $last_d $last_t $last_z"
+echo
+if [ "$clean" = 1 ]; then
+  echo "  ended:     with a shutdown or a reboot"
+else
+  echo "  ended:     without a shutdown: the log just stops (a freeze, a crash or lost power)"
+fi
+[ -n "$gap" ] && echo "  next boot: $next_d $next_t $next_z, $gap later"
+echo
+indent() { while IFS= read -r l; do printf '  %s\n' "$l"; done; }
+noise='audit:|audit\[|kauditd'
+echo "last log lines (kernel audit noise removed):"
+grep -vE "$noise" <<< "$tail_lines" | tail -n 12 | indent
+echo
+# Audit messages can fill the kernel log's last thousands of lines, so read far back before filtering.
+echo "last kernel lines (audit noise removed):"
+kernel=$(journalctl -k -b "$boot" -n 20000 --no-pager -o short-iso 2>/dev/null | grep -vE "$noise" | tail -n 8)
+if [ -n "$kernel" ]; then indent <<< "$kernel"; else echo "  (none left after removing audit noise)"; fi
+echo
+# systemd-pstore moves each crash's saved logs into a directory named after the time it did so.
+echo "saved panic logs (/var/lib/systemd/pstore):"
+found=0
+for d in "${SF_ROOT:-}"/var/lib/systemd/pstore/*/; do
+  [ -d "$d" ] || continue
+  found=1
+  name=$(basename "$d")
+  when=$name
+  if [[ "$name" =~ ^[0-9]+$ ]]; then when="$name ($(date -u -d "@$name" '+%F %T UTC'))"; fi
+  printf '  %s: %s file(s)\n' "$when" "$(find "$d" -type f | wc -l | tr -d ' ')"
+done
+[ "$found" = 1 ] || echo "  none"
+
+if [ "$clean" = 0 ] && [ -n "$notify" ]; then
+  title="$(hostname): back after an unclean stop"
+  summary="Boot $boot ended at $last_d $last_t $last_z without a shutdown${gap:+; it was down $gap}."
+  # shellcheck disable=SC2086  # CMD may carry its own arguments
+  $notify "$title" "$summary" || echo "last-boot: the --notify command failed" >&2
+fi
+[ "$clean" = 1 ] && exit 0
+exit 1

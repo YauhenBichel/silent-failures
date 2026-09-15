@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- A template. Replace NAME (three times) and the path to reachability-watch.sh, then:
+         cp reachability-watch.plist ~/Library/LaunchAgents/com.github.silent-failures.reachability-watch.NAME.plist
+         launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.github.silent-failures.reachability-watch.NAME.plist
+       Settings go in ~/.config/reachability-watch/NAME.env (see the script). -->
+  <key>Label</key>
+  <string>com.github.silent-failures.reachability-watch.NAME</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/path/to/silent-failures/mac/reachability-watch.sh</string>
+    <string>NAME</string>
+  </array>
+  <key>StartInterval</key>
+  <integer>30</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardErrorPath</key>
+  <string>/tmp/reachability-watch-NAME.err</string>
+</dict>
+</plist>

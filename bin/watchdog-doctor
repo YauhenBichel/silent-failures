@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Yauhen Bichel
+#
+# watchdog-doctor: will this Linux box reboot itself when it hangs?
+#
+#   watchdog-doctor           check, then print a verdict and what to fix
+#   watchdog-doctor --help
+#
+# Read-only, no root needed. Exit 0: a hang reboots the box. Exit 1: it would stay frozen until
+# someone power-cycles it. Exit 2: bad usage.
+#
+# Why: a server's systemd was set to feed a hardware watchdog, and a load rule for the watchdog driver
+# sat in /etc/modules-load.d. There was still no watchdog: the distribution blacklists the driver, and
+# systemd-modules-load skips blacklisted modules without a word. The box froze and stayed frozen for 8
+# hours. This finds that, and the other settings that decide whether a hang ends in a reboot.
+#
+# Tests move every path under SF_ROOT and take systemctl, sysctl, modinfo, uname and systemd-analyze
+# from PATH.
+set -uo pipefail
+export LC_ALL=C
+
+case "${1:-}" in
+  -h|--help) sed -n '5,17p' "$0" | sed -E 's/^# ?//'; exit 0 ;;
+  "") ;;
+  *) echo "usage: watchdog-doctor [--help]" >&2; exit 2 ;;
+esac
+
+ROOT=${SF_ROOT:-}
+fails=0
+fixes=()
+say() { printf '  %-5s %-16s %s\n' "$1" "$2" "$3"; if [ "$1" = FAIL ]; then fails=$((fails + 1)); fi; }
+fix() { fixes+=("$1"); }
+sc() { sysctl -n "$1" 2>/dev/null || echo "?"; }
+# module names treat - and _ alike: as a regular expression, accept either
+mod_re() { local m=${1//-/_}; echo "${m//_/[-_]}"; }
+
+echo "watchdog-doctor: will this box reboot itself when it hangs?"
+echo
+
+# ---- watchdog devices ----
+devices=0 active=""
+for d in "$ROOT"/sys/class/watchdog/watchdog*; do
+  [ -d "$d" ] || continue
+  devices=$((devices + 1))
+  name=${d##*/}
+  identity=$(cat "$d/identity" 2>/dev/null || echo "?")
+  state=$(cat "$d/state" 2>/dev/null || echo "?")
+  timeout=$(cat "$d/timeout" 2>/dev/null || echo "?")
+  case "$state" in
+    active) say ok "$name" "$identity, active, times out after $timeout s: something feeds it"; active=$name ;;
+    "?")    say warn "$name" "$identity, state unreadable, times out after $timeout s" ;;
+    *)      say warn "$name" "$identity, $state: present, but nothing feeds it" ;;
+  esac
+done
+[ "$devices" = 0 ] && say FAIL "device" "no watchdog device: nothing can reset this box when it hangs"
+
+# ---- watchdog drivers that match this hardware ----
+kver=$(uname -r)
+modaliases=$(cat "$ROOT"/sys/bus/pci/devices/*/modalias "$ROOT"/sys/bus/acpi/devices/*/modalias 2>/dev/null || true)
+matched=0
+for ko in "$ROOT/lib/modules/$kver/kernel/drivers/watchdog/"*.ko*; do
+  [ -f "$ko" ] || continue
+  m=${ko##*/}; m=${m%%.ko*}; m=${m//-/_}
+  hit=0
+  while IFS= read -r alias; do
+    [ -n "$alias" ] || continue
+    while IFS= read -r device; do
+      # shellcheck disable=SC2053  # a module alias is a glob pattern
+      if [ -n "$device" ] && [[ $device == $alias ]]; then hit=1; break 2; fi
+    done <<< "$modaliases"
+  done < <(modinfo -F alias "$m" 2>/dev/null)
+  [ "$hit" = 1 ] || continue
+  matched=1
+  re=$(mod_re "$m")
+  blacklisted=""
+  for f in "$ROOT"/etc/modprobe.d/*.conf "$ROOT"/run/modprobe.d/*.conf "$ROOT"/usr/lib/modprobe.d/*.conf "$ROOT"/lib/modprobe.d/*.conf; do
+    if [ -f "$f" ] && grep -qE "^[[:space:]]*blacklist[[:space:]]+${re}[[:space:]]*\$" "$f"; then
+      blacklisted=${f#"$ROOT"}; break
+    fi
+  done
+  rules=()
+  for f in "$ROOT"/etc/modules-load.d/*.conf "$ROOT"/run/modules-load.d/*.conf "$ROOT"/usr/lib/modules-load.d/*.conf "$ROOT"/etc/modules; do
+    if [ -f "$f" ] && grep -qE "^[[:space:]]*${re}[[:space:]]*(#.*)?\$" "$f"; then rules+=("${f#"$ROOT"}"); fi
+  done
+  if [ -d "$ROOT/sys/module/$m" ]; then
+    say ok "$m" "matches this hardware and is loaded"
+  elif [ -n "$blacklisted" ]; then
+    say FAIL "$m" "matches this hardware, but $blacklisted blacklists it: it never loads by itself"
+    for r in "${rules[@]}"; do
+      say FAIL "load rule" "$r names $m, and does nothing: systemd-modules-load skips blacklisted modules"
+    done
+    fix "load $m at boot from a oneshot unit that runs 'modprobe $m': naming the module is not blocked by the blacklist (see the README)"
+  else
+    say warn "$m" "matches this hardware, but is not loaded"
+    fix "sudo modprobe $m, and put '$m' in /etc/modules-load.d/$m.conf"
+  fi
+done
+if [ "$devices" = 0 ] && [ "$matched" = 0 ]; then
+  say warn "driver" "no watchdog driver for kernel $kver matches this hardware"
+  fix "softdog (sudo modprobe softdog) resets a box whose systemd stops, though not one whose kernel hangs"
+fi
+
+# ---- systemd feeds it ----
+rt=$(systemctl show -p RuntimeWatchdogUSec --value 2>/dev/null || true)
+if [ -z "$rt" ] || [ "$rt" = 0 ]; then
+  if [ "$devices" -gt 0 ] && [ -z "$active" ]; then
+    say FAIL "systemd" "RuntimeWatchdogSec is not set: the watchdog is there, but nothing feeds it"
+  else
+    say warn "systemd" "RuntimeWatchdogSec is not set"
+  fi
+  fix "RuntimeWatchdogSec=30s under [Manager] in /etc/systemd/system.conf.d/60-watchdog.conf, then sudo systemctl daemon-reexec"
+else
+  say ok "systemd" "RuntimeWatchdogSec=$rt"
+fi
+
+# ---- the kernel ----
+panic=$(sc kernel.panic)
+case "$panic" in
+  "?") say warn "kernel.panic" "unreadable" ;;
+  0)   if [ -n "$active" ]; then say warn "kernel.panic" "0: after a panic, only the watchdog reboots the box"
+       else say FAIL "kernel.panic" "0: after a panic the box waits forever"; fi
+       fix "kernel.panic = 10 in /etc/sysctl.d/60-panic.conf" ;;
+  -*)  say ok "kernel.panic" "$panic: reboots at once after a panic" ;;
+  *)   say ok "kernel.panic" "$panic: reboots $panic s after a panic" ;;
+esac
+soft=$(sc kernel.softlockup_panic)
+if [ "$soft" = 1 ]; then
+  say ok "soft lockups" "a soft lockup panics"
+else
+  say warn "soft lockups" "kernel.softlockup_panic=$soft: a soft lockup is only logged"
+  fix "kernel.softlockup_panic = 1 in /etc/sysctl.d/60-panic.conf"
+fi
+nmi=$(sc kernel.nmi_watchdog); hard=$(sc kernel.hardlockup_panic)
+if [ "$nmi" = 0 ]; then
+  say warn "hard lockups" "kernel.nmi_watchdog=0: a hard lockup is not even noticed"
+elif [ "$hard" = 1 ]; then
+  say ok "hard lockups" "a hard lockup panics"
+else
+  say warn "hard lockups" "kernel.hardlockup_panic=$hard: a hard lockup is only logged"
+  fix "kernel.hardlockup_panic = 1 in /etc/sysctl.d/60-panic.conf"
+fi
+
+# ---- evidence of the last seconds ----
+backend=$(cat "$ROOT/sys/module/pstore/parameters/backend" 2>/dev/null || true)
+if [ -n "$backend" ] && [ "$backend" != "(null)" ]; then
+  say ok "panic logs" "kept across a reboot by pstore ($backend)"
+elif [ -d "$ROOT/sys/module/efi_pstore" ]; then
+  say ok "panic logs" "kept across a reboot by efi_pstore"
+else
+  say warn "panic logs" "no pstore backend: a panic's log is lost at the reboot"
+  fix "sudo modprobe efi_pstore (UEFI machines)"
+fi
+sync=$(systemd-analyze cat-config systemd/journald.conf 2>/dev/null | sed -nE 's/^[[:space:]]*SyncIntervalSec=([^[:space:]#]*).*/\1/p' | tail -n1)
+if [ -n "$sync" ]; then
+  say ok "journal sync" "SyncIntervalSec=$sync"
+else
+  say warn "journal sync" "default, every 5 min: the last minutes before a freeze are lost"
+  fix "SyncIntervalSec=15s under [Journal] in /etc/systemd/journald.conf.d/60-sync.conf"
+fi
+
+echo
+if [ "$fails" = 0 ]; then
+  echo "Verdict: a hang reboots this box by itself."
+else
+  echo "Verdict: this box would stay frozen until someone power-cycles it."
+fi
+if [ "${#fixes[@]}" -gt 0 ]; then
+  echo
+  echo "To fix (printed, not run):"
+  printf '  - %s\n' "${fixes[@]}"
+fi
+[ "$fails" = 0 ]
