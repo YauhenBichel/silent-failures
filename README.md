@@ -9,6 +9,11 @@ A hardware watchdog that never loads. A nightly job that fails every night. Firm
 server that froze, and nobody was told. Each tool here answers one question like that. It reads the system without
 changing it, and prints what to fix.
 
+These are Linux (systemd) checks, plus one macOS watcher. This is `watchdog-doctor`, run on the server that froze
+(the full text version is [below](#watchdog-doctor)):
+
+![watchdog-doctor output: no watchdog device, a blacklisted driver, and the verdict that the box would stay frozen](docs/watchdog-doctor.svg)
+
 ## Why
 
 Every tool comes from one real incident, on a home GPU server (AMD Ryzen AI Max+ 395):
@@ -286,6 +291,31 @@ shellcheck -x bin/watchdog-doctor bin/last-boot bin/timer-failures bin/gpu-mem-s
 
 The tests build fake machines: files under `SF_ROOT`, and stubs for `systemctl`, `journalctl`, `sysctl` and friends.
 CI runs ShellCheck and every test on Linux, and the macOS parts on macOS.
+
+## FAQ
+
+### How do I check that my Linux server will reboot itself when it hangs?
+
+Run `watchdog-doctor`. It checks for a watchdog device, the driver, systemd's `RuntimeWatchdogSec` and the kernel
+panic settings, then prints a verdict and what to fix. Exit code 0 means a hang reboots the box.
+
+### Do these tools change my system?
+
+No. They read the system and print suggestions. Check a suggestion before you run it.
+
+### Does it send my data anywhere?
+
+No tool sends your data. `firmware-drift` makes requests to gitlab.com to read the upstream linux-firmware
+history. `mac/reachability-watch.sh` only talks to the server you name, and shows a local macOS notification.
+
+### Does it run on macOS or Windows?
+
+Only `mac/reachability-watch.sh` runs on macOS. The other tools need Linux with systemd. Nothing runs on Windows.
+
+### Is it a monitoring system?
+
+No. Each tool is a single check you run by hand, from a timer or from CI. Use the exit codes (`0` good, `1` wrong,
+`2` could not tell) to feed your own alerting.
 
 ## Contributing
 

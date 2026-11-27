@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 859 496" width="859" height="496" role="img" aria-label="Terminal output of watchdog-doctor on a server that would stay frozen after a hang">
+<rect width="859" height="496" rx="10" fill="#0d1117" stroke="#30363d"/>
+<g font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="13">
+<text x="24" y="28" fill="#7ee787" xml:space="preserve">$ watchdog-doctor</text>
+<text x="24" y="47" fill="#e6edf3" xml:space="preserve">watchdog-doctor: will this box reboot itself when it hangs?</text>
+<text x="24" y="66" fill="#e6edf3" xml:space="preserve"></text>
+<text x="24" y="85" fill="#ff7b72" xml:space="preserve">  FAIL  device           no watchdog device: nothing can reset this box when it hangs</text>
+<text x="24" y="104" fill="#ff7b72" xml:space="preserve">  FAIL  sp5100_tco       matches this hardware, but</text>
+<text x="24" y="123" fill="#e6edf3" xml:space="preserve">                              /usr/lib/modprobe.d/blacklist_linux-hwe-7.0_7.0.0-31-generic.conf</text>
+<text x="24" y="142" fill="#e6edf3" xml:space="preserve">                              blacklists it: it never loads by itself</text>
+<text x="24" y="161" fill="#ff7b72" xml:space="preserve">  FAIL  load rule        /etc/modules-load.d/watchdog.conf names sp5100_tco, and does nothing:</text>
+<text x="24" y="180" fill="#e6edf3" xml:space="preserve">                              systemd-modules-load skips blacklisted modules</text>
+<text x="24" y="199" fill="#7ee787" xml:space="preserve">  ok    systemd          RuntimeWatchdogSec=30s</text>
+<text x="24" y="218" fill="#7ee787" xml:space="preserve">  ok    kernel.panic     10: reboots 10 s after a panic</text>
+<text x="24" y="237" fill="#e3b341" xml:space="preserve">  warn  soft lockups     kernel.softlockup_panic=0: a soft lockup is only logged</text>
+<text x="24" y="256" fill="#e3b341" xml:space="preserve">  warn  hard lockups     kernel.hardlockup_panic=0: a hard lockup is only logged</text>
+<text x="24" y="275" fill="#7ee787" xml:space="preserve">  ok    panic logs       kept across a reboot by pstore (efi_pstore)</text>
+<text x="24" y="294" fill="#e3b341" xml:space="preserve">  warn  journal sync     default, every 5 min: the last minutes before a freeze are lost</text>
+<text x="24" y="313" fill="#e6edf3" xml:space="preserve"></text>
+<text x="24" y="332" fill="#ff7b72" xml:space="preserve">Verdict: this box would stay frozen until someone power-cycles it.</text>
+<text x="24" y="351" fill="#e6edf3" xml:space="preserve"></text>
+<text x="24" y="370" fill="#e6edf3" xml:space="preserve">To fix (printed, not run):</text>
+<text x="24" y="389" fill="#e6edf3" xml:space="preserve">  - load sp5100_tco at boot from a oneshot unit that runs &#x27;modprobe sp5100_tco&#x27;: naming the module is</text>
+<text x="24" y="408" fill="#e6edf3" xml:space="preserve">                              not blocked by the blacklist (see the README)</text>
+<text x="24" y="427" fill="#e6edf3" xml:space="preserve">  - kernel.softlockup_panic = 1 in /etc/sysctl.d/60-panic.conf</text>
+<text x="24" y="446" fill="#e6edf3" xml:space="preserve">  - kernel.hardlockup_panic = 1 in /etc/sysctl.d/60-panic.conf</text>
+<text x="24" y="465" fill="#e6edf3" xml:space="preserve">  - SyncIntervalSec=15s under [Journal] in /etc/systemd/journald.conf.d/60-sync.conf</text>
+</g>
+</svg>
